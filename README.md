@@ -41,6 +41,21 @@ Right: Unsupervised depth pre-training with Gaussian splatting leads to reduced 
 
 ## Installation
 
+### H100 / Difix3D+
+
+The reproducible H100 environment and the official NVIDIA Difix weights are prepared from the repository root:
+
+```bash
+./setup_difix_env.sh
+./setup_difix_weights.sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate ./.conda/envs/gscompleter-difix3d
+```
+
+The environment is stored under `.conda/` on the shared filesystem, uses PyTorch 2.4.0 + CUDA 12.1, and compiles the rasterizer for H100 (`sm_90`). Select a GPU with `GPU=0`; the integrated pipeline is run with `./infer_dl3dv.sh`.
+
+The weight cache is `../Difix3D/checkpoints/nvidia-difix`. Set `DIFIX_WEIGHTS_DIR` or `DIFIX_MODEL` if the shared storage layout differs.
+
 Our code is developed using PyTorch 2.4.0, CUDA 12.4, and Python 3.10. 
 
 We recommend setting up a virtual environment using either [conda](https://docs.anaconda.com/miniconda/) or [venv](https://docs.python.org/3/library/venv.html) before installation:
@@ -436,5 +451,4 @@ We fine-tune our Gaussian Splatting pre-trained depth model using ground-truth d
 ## Acknowledgements
 
 This project is developed with several fantastic repos: [pixelSplat](https://github.com/dcharatan/pixelsplat), [MVSplat](https://github.com/donydchen/mvsplat), [MVSplat360](https://github.com/donydchen/mvsplat360), [UniMatch](https://github.com/autonomousvision/unimatch), [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) and [DL3DV](https://github.com/DL3DV-10K/Dataset). We thank the original authors for their excellent work.
-
 
