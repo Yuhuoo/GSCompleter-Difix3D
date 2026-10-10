@@ -18,7 +18,7 @@ CHECKPOINT="$(to_abs "${CHECKPOINT:-pretrained/depthsplat-gs-base-dl3dv-256x448-
 RUN_ROOT="$(to_abs "${RUN_ROOT:-outputs/dl3dv_difix_distill}")"
 DIFIX_REPO="$(to_abs "${DIFIX_REPO:-../Difix3D}")"
 DIFIX_PYTHON="${DIFIX_PYTHON:-python}"
-DIFIX_MODEL="${DIFIX_MODEL:-nvidia/difix}"
+DIFIX_MODEL="${DIFIX_MODEL:-$DIFIX_REPO/checkpoints/nvidia-difix}"
 if [[ "$DIFIX_MODEL" == ./* || "$DIFIX_MODEL" == ../* ]]; then
   DIFIX_MODEL="$(to_abs "$DIFIX_MODEL")"
 fi
@@ -31,7 +31,8 @@ EXPECTED_SCENES="${EXPECTED_SCENES:-140}"
 [[ -d "$DATA_ROOT" ]] || { echo "Missing DATA_ROOT: $DATA_ROOT" >&2; exit 1; }
 [[ -f "$INDEX_PATH" ]] || { echo "Missing INDEX_PATH: $INDEX_PATH" >&2; exit 1; }
 [[ -f "$CHECKPOINT" ]] || { echo "Missing CHECKPOINT: $CHECKPOINT" >&2; exit 1; }
-[[ -f "$DIFIX_REPO/infer_dl3dv_novel.py" ]] || { echo "Missing DiFix3D novel-view adapter in $DIFIX_REPO" >&2; exit 1; }
+[[ -f "$ROOT_DIR/src/run_difix.py" ]] || { echo "Missing local DiFix adapter: $ROOT_DIR/src/run_difix.py" >&2; exit 1; }
+[[ -d "$DIFIX_MODEL" ]] || { echo "Missing DIFIX_MODEL directory: $DIFIX_MODEL" >&2; exit 1; }
 [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "STEPS must be a positive integer" >&2; exit 1; }
 
 common_args=(
@@ -55,18 +56,18 @@ CUDA_VISIBLE_DEVICES="$GPU" DIFIX_PHASE=prepare DIFIX_ROOT="$RUN_ROOT" \
   DIFIX_SCENE="$SCENE" DIFIX_OVERWRITE="$OVERWRITE" \
   python -m src.difix_distill "${common_args[@]}"
 
-echo "[2/4] DiFix3D single-view target-view repair"
+echo "[2/4] DiFix3D+ single-view target-view repair"
 difix_args=(
   --input-root "$RUN_ROOT/target_input"
   --output-root "$RUN_ROOT/target_fixed"
-  --model "$DIFIX_MODEL"
+  --model-path "$DIFIX_MODEL"
+  --prompt "remove degradation"
+  --timestep 199
+  --difix-repo "$DIFIX_REPO"
 )
 [[ -z "$SCENE" ]] || difix_args+=(--scene "$SCENE")
 [[ "$OVERWRITE" != "1" ]] || difix_args+=(--overwrite)
-(
-  cd "$DIFIX_REPO"
-  CUDA_VISIBLE_DEVICES="$GPU" "$DIFIX_PYTHON" infer_dl3dv_novel.py "${difix_args[@]}"
-)
+CUDA_VISIBLE_DEVICES="$GPU" "$DIFIX_PYTHON" "$ROOT_DIR/src/run_difix.py" "${difix_args[@]}"
 
 echo "[3/4] Distilling the repaired target view into trainable Gaussians ($STEPS steps/scene)"
 CUDA_VISIBLE_DEVICES="$GPU" DIFIX_PHASE=distill DIFIX_ROOT="$RUN_ROOT" \
