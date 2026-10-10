@@ -31,7 +31,7 @@ METRICS_PATH="${METRICS_PATH:-$RUN_ROOT/metrics.json}"
 DIFIX_REPO="${DIFIX_REPO:-../Difix3D}"
 DIFIX_REPO="$(cd "$DIFIX_REPO" && pwd)"
 DIFIX_PYTHON="${DIFIX_PYTHON:-python}"
-DIFIX_MODEL="${DIFIX_MODEL:-$DIFIX_REPO/checkpoints/model.pkl}"
+DIFIX_MODEL="${DIFIX_MODEL:-$DIFIX_REPO/checkpoints/nvidia-difix}"
 RUN_ROOT="$(to_abs "$RUN_ROOT")"
 DEPTHSPLAT_OUTPUT="$(to_abs "$DEPTHSPLAT_OUTPUT")"
 DIFIX_INPUT_ROOT="$(to_abs "$DIFIX_INPUT_ROOT")"
@@ -47,7 +47,7 @@ SKIP_DEPTHSPLAT="${SKIP_DEPTHSPLAT:-0}"
 [[ -d "$DATA_ROOT" ]] || { echo "Missing DATA_ROOT: $DATA_ROOT" >&2; exit 1; }
 [[ -f "$INDEX_PATH" ]] || { echo "Missing INDEX_PATH: $INDEX_PATH" >&2; exit 1; }
 [[ -f "$CHECKPOINT" ]] || { echo "Missing CHECKPOINT: $CHECKPOINT" >&2; exit 1; }
-[[ -f "$DIFIX_MODEL" ]] || { echo "Missing DIFIX_MODEL: $DIFIX_MODEL" >&2; exit 1; }
+[[ -d "$DIFIX_MODEL" ]] || { echo "Missing DIFIX_MODEL directory: $DIFIX_MODEL" >&2; exit 1; }
 
 if [[ "$OVERWRITE" == "1" ]]; then
   if [[ "$SKIP_DEPTHSPLAT" != "1" ]]; then
@@ -105,9 +105,8 @@ if [[ -n "$SCENE" ]]; then
   difix_args+=(--scene "$SCENE")
 fi
 (
-  cd "$DIFIX_REPO"
-  PYTHONPATH="$DIFIX_REPO/src${PYTHONPATH:+:$PYTHONPATH}" \
-    CUDA_VISIBLE_DEVICES="$GPU" "$DIFIX_PYTHON" infer_dl3dv.py "${difix_args[@]}"
+  CUDA_VISIBLE_DEVICES="$GPU" "$DIFIX_PYTHON" "$ROOT_DIR/src/run_difix.py" \
+    "${difix_args[@]}" --difix-repo "$DIFIX_REPO"
 )
 
 echo "[4/4] Computing target-view metrics"
