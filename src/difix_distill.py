@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import hydra
@@ -94,24 +95,169 @@ def prepare_scene(batch: dict, encoder, decoder, root: Path) -> None:
         save_image(target_render, target_dir / "target.png")
 
 
-def trainable_gaussians(initial: Gaussians):
-    means = nn.Parameter(initial.means.detach().clone())
-    sh = nn.Parameter(initial.harmonics.detach().clone())
-    opacity_logits = nn.Parameter(torch.logit(initial.opacities.detach().clamp(1e-4, 1 - 1e-4)))
-    log_scales = nn.Parameter(torch.zeros_like(initial.opacities))
+class TrainableGaussians:
+    """Trainable DepthSplat Gaussians with lightweight GS topology updates.
 
-    def current():
-        scale_squared = (2 * log_scales).exp()[..., None, None]
-        return Gaussians(means, initial.covariances.detach() * scale_squared,
-                         sh, opacity_logits.sigmoid())
+    The official gsplat strategy cannot be used directly because this branch
+    renders with DepthSplat's decoder rather than gsplat's rasterizer.  This
+    class mirrors the relevant behavior: high-gradient visible points are
+    split into smaller copies, while nearly transparent points are pruned.
+    """
 
-    optimizer = torch.optim.Adam([
-        {"params": [means], "lr": 1.6e-4},
-        {"params": [sh], "lr": 2.5e-3},
-        {"params": [opacity_logits], "lr": 1e-3},
-        {"params": [log_scales], "lr": 5e-4},
-    ])
-    return current, optimizer, (means, sh, opacity_logits, log_scales)
+    def __init__(self, initial: Gaussians):
+        self.initial_covariances = initial.covariances.detach().clone()
+        self.means = nn.Parameter(initial.means.detach().clone())
+        self.harmonics = nn.Parameter(initial.harmonics.detach().clone())
+        self.opacity_logits = nn.Parameter(
+            torch.logit(initial.opacities.detach().clamp(1e-4, 1 - 1e-4)))
+        # One isotropic multiplier per Gaussian keeps the covariance update
+        # stable while still allowing the repaired view to change support.
+        self.log_scales = nn.Parameter(torch.zeros_like(initial.opacities))
+        self.optimizer = None
+        self.rebuild_optimizer()
+
+    @property
+    def num_gaussians(self) -> int:
+        return int(self.means.shape[1])
+
+    def current(self) -> Gaussians:
+        scale = self.log_scales.exp()
+        covariances = self.initial_covariances * scale[..., None, None] ** 2
+        return Gaussians(
+            means=self.means,
+            covariances=covariances,
+            harmonics=self.harmonics,
+            opacities=self.opacity_logits.sigmoid(),
+        )
+
+    def rebuild_optimizer(self) -> None:
+        self.optimizer = torch.optim.Adam([
+            {"params": [self.means], "lr": 1.6e-4},
+            {"params": [self.harmonics], "lr": 2.5e-3},
+            {"params": [self.opacity_logits], "lr": 1e-3},
+            {"params": [self.log_scales], "lr": 5e-4},
+        ])
+
+    def _append(self, indices: torch.Tensor) -> int:
+        if indices.numel() == 0:
+            return 0
+        # Split selected points into nearby smaller copies.  Estimate a local
+        # world-space radius from the covariance so the offset is scene-scale
+        # aware across DL3DV scenes.
+        base_means = self.means.detach()[:, indices]
+        base_covariances = self.initial_covariances[:, indices]
+        base_scale = base_covariances.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-8).sqrt()
+        base_scale = base_scale * self.log_scales.detach()[:, indices].exp()
+        base_scale = base_scale[..., None]
+        noise = torch.randn_like(base_means) * base_scale * 0.35
+        new_means = base_means + noise
+        new_harmonics = self.harmonics.detach()[:, indices].clone()
+        # Preserve approximately the same accumulated opacity after splitting.
+        old_opacity = self.opacity_logits.detach()[:, indices].sigmoid()
+        split_opacity = (old_opacity * 0.5).clamp(1e-4, 1 - 1e-4)
+        split_logits = torch.logit(split_opacity)
+        updated_opacity = self.opacity_logits.detach().clone()
+        updated_opacity[:, indices] = split_logits
+        new_opacity = split_logits.clone()
+        new_log_scales = self.log_scales.detach()[:, indices] - 0.5
+
+        self.means = nn.Parameter(torch.cat([self.means.detach(), new_means], dim=1))
+        self.harmonics = nn.Parameter(
+            torch.cat([self.harmonics.detach(), new_harmonics], dim=1))
+        self.opacity_logits = nn.Parameter(torch.cat([updated_opacity, new_opacity], dim=1))
+        self.log_scales = nn.Parameter(
+            torch.cat([self.log_scales.detach(), new_log_scales], dim=1))
+        self.initial_covariances = torch.cat(
+            [self.initial_covariances, self.initial_covariances[:, indices]], dim=1)
+        return int(indices.numel())
+
+    def _prune(self, opacity_threshold: float, min_gaussians: int) -> int:
+        if self.num_gaussians <= min_gaussians:
+            return 0
+        keep = self.opacity_logits.sigmoid().squeeze(0) >= opacity_threshold
+        if int(keep.sum()) < min_gaussians:
+            topk = torch.topk(
+                self.opacity_logits.sigmoid().squeeze(0),
+                k=min(min_gaussians, self.num_gaussians),
+            ).indices
+            keep = torch.zeros_like(keep)
+            keep[topk] = True
+        removed = self.num_gaussians - int(keep.sum())
+        if removed <= 0:
+            return 0
+        keep_b = keep.unsqueeze(0)
+        self.means = nn.Parameter(self.means.detach()[:, keep])
+        self.harmonics = nn.Parameter(self.harmonics.detach()[:, keep])
+        self.opacity_logits = nn.Parameter(self.opacity_logits.detach()[:, keep])
+        self.log_scales = nn.Parameter(self.log_scales.detach()[:, keep])
+        self.initial_covariances = self.initial_covariances[:, keep_b.squeeze(0)]
+        return removed
+
+    def densify_and_prune(
+        self,
+        grad_scores: torch.Tensor,
+        visible: torch.Tensor,
+        *,
+        grad_threshold: float,
+        max_new: int,
+        max_gaussians: int,
+        opacity_threshold: float,
+        min_gaussians: int,
+    ) -> tuple[int, int]:
+        grad_scores = torch.nan_to_num(grad_scores.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        visible = visible.detach().bool()
+        candidate_mask = visible & (grad_scores >= grad_threshold)
+        candidate_ids = torch.where(candidate_mask)[0]
+        available = max(0, max_gaussians - self.num_gaussians)
+        num_to_add = min(int(candidate_ids.numel()), max_new, available)
+        if num_to_add > 0:
+            if candidate_ids.numel() > num_to_add:
+                candidate_ids = candidate_ids[
+                    torch.topk(grad_scores[candidate_ids], k=num_to_add).indices]
+            added = self._append(candidate_ids)
+        else:
+            added = 0
+        removed = self._prune(opacity_threshold, min_gaussians)
+        if added or removed:
+            self.rebuild_optimizer()
+        return added, removed
+
+
+@torch.no_grad()
+def visible_gaussians(
+    means: torch.Tensor,
+    camera: dict,
+    margin: float = 0.05,
+) -> torch.Tensor:
+    """Return a conservative frustum mask for one target camera.
+
+    DepthSplat's decoder returns only color/depth, unlike gsplat's rasterizer,
+    so there is no per-Gaussian radii tensor to use for densification.  The
+    frustum test keeps topology updates limited to points that can contribute
+    to the current view while avoiding a dependency on another rasterizer.
+    """
+    # The evaluation camera convention is camera-to-world.  The normalized
+    # intrinsics therefore map camera-space points to coordinates in [0, 1].
+    extrinsics = camera["extrinsics"][0, 0]
+    intrinsics = camera["intrinsics"][0, 0]
+    near = camera["near"][0, 0]
+    far = camera["far"][0, 0]
+    points = means[0]
+    points_h = torch.cat(
+        [points, torch.ones_like(points[..., :1])], dim=-1)
+    camera_points = (torch.linalg.inv(extrinsics) @ points_h.t()).t()[..., :3]
+    depth = camera_points[..., 2]
+    projected = camera_points @ intrinsics.transpose(0, 1)
+    safe_depth = depth.clamp_min(1e-6)
+    uv = projected[..., :2] / safe_depth[..., None]
+    return (
+        (depth > near.clamp_min(1e-5))
+        & (depth < far)
+        & (uv[..., 0] >= -margin)
+        & (uv[..., 0] <= 1.0 + margin)
+        & (uv[..., 1] >= -margin)
+        & (uv[..., 1] <= 1.0 + margin)
+    )
 
 
 def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None:
@@ -124,8 +270,20 @@ def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None
     repaired_target = load_image(fixed_path).to(device)
 
     initial = initial_gaussians(encoder, batch)
-    current, optimizer, params = trainable_gaussians(initial)
-    initial_values = tuple(param.detach().clone() for param in params)
+    state = TrainableGaussians(initial)
+    initial_means = state.means.detach().clone()
+    initial_harmonics = state.harmonics.detach().clone()
+    densify_enabled = os.environ.get("DIFIX_DENSIFY", "1") == "1"
+    densify_interval = int(os.environ.get("DIFIX_DENSIFY_INTERVAL", "100"))
+    densify_start = int(os.environ.get("DIFIX_DENSIFY_START", "100"))
+    densify_stop = int(os.environ.get(
+        "DIFIX_DENSIFY_STOP", str(max(densify_start, int(0.7 * steps)))))
+    densify_threshold = float(os.environ.get("DIFIX_DENSIFY_GRAD_THRESHOLD", "2e-4"))
+    max_new = int(os.environ.get("DIFIX_MAX_NEW_GAUSSIANS", "4096"))
+    max_gaussians = int(os.environ.get("DIFIX_MAX_GAUSSIANS", "300000"))
+    opacity_threshold = float(os.environ.get("DIFIX_PRUNE_OPACITY", "0.005"))
+    min_gaussians = int(os.environ.get("DIFIX_MIN_GAUSSIANS", "1024"))
+    topology_stats = [{"step": 0, "num_gaussians": state.num_gaussians}]
     for step in tqdm(range(steps), desc=f"Distill {scene[:12]}", leave=False):
         # Keep most updates anchored to the real input views and use the
         # repaired held-out target as the completion supervision.
@@ -140,22 +298,75 @@ def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None
             # load_image returns [C, H, W], matching the renderer output.
             label = repaired_target
 
-        prediction = render(decoder, current(), camera, shape)
+        output = decoder(
+            state.current(), camera["extrinsics"], camera["intrinsics"],
+            camera["near"], camera["far"], shape,
+        )
+        prediction = output.color[0, 0]
         loss = F.l1_loss(prediction, label)
-        loss = loss + 1e-3 * (params[0] - initial_values[0]).square().mean()
-        loss = loss + 1e-4 * (params[1] - initial_values[1]).square().mean()
-        loss = loss + 1e-4 * params[3].square().mean()
-        optimizer.zero_grad(set_to_none=True)
+        loss = loss + 1e-3 * (state.means - initial_means).square().mean()
+        loss = loss + 1e-4 * (state.harmonics - initial_harmonics).square().mean()
+        loss = loss + 1e-4 * state.log_scales.square().mean()
+        state.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        optimizer.step()
+        grad_scores = (
+            state.means.grad.detach().norm(dim=-1).squeeze(0)
+            if state.means.grad is not None
+            else torch.zeros(state.num_gaussians, device=device)
+        )
+        visible = visible_gaussians(state.means, camera)
+        state.optimizer.step()
+
+        if (
+            densify_enabled
+            and densify_interval > 0
+            and densify_start <= step < densify_stop
+            and (step + 1) % densify_interval == 0
+        ):
+            added, removed = state.densify_and_prune(
+                grad_scores,
+                visible,
+                grad_threshold=densify_threshold,
+                max_new=max_new,
+                max_gaussians=max_gaussians,
+                opacity_threshold=opacity_threshold,
+                min_gaussians=min_gaussians,
+            )
+            topology_stats.append({
+                "step": step + 1,
+                "added": added,
+                "removed": removed,
+                "num_gaussians": state.num_gaussians,
+            })
+            if added or removed:
+                # Re-anchor the small stabilization terms to the new topology
+                # after parameters have been added or removed.
+                initial_means = state.means.detach().clone()
+                initial_harmonics = state.harmonics.detach().clone()
+                tqdm.write(
+                    f"[{scene[:12]}] topology step {step + 1}: "
+                    f"+{added}/-{removed}, N={state.num_gaussians}")
 
     target_id = int(batch["target"]["index"][0, 0])
     target = {key: batch["target"][key] for key in
               ("extrinsics", "intrinsics", "near", "far")}
     with torch.no_grad():
-        image = render(decoder, current(), target, shape)
+        image = render(decoder, state.current(), target, shape)
     save_image(image, root / "distilled" / "images" / scene / "color" / f"{target_id:06d}.png")
-    del optimizer, current, params, initial_values
+    stats_path = root / "distilled" / "stats" / f"{scene}.json"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_path.write_text(json.dumps({
+        "scene": scene,
+        "steps": steps,
+        "densify_enabled": densify_enabled,
+        "densify_interval": densify_interval,
+        "densify_start": densify_start,
+        "densify_stop": densify_stop,
+        "initial_gaussians": topology_stats[0]["num_gaussians"],
+        "final_gaussians": state.num_gaussians,
+        "topology": topology_stats,
+    }, indent=2), encoding="utf-8")
+    del state
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="main")
