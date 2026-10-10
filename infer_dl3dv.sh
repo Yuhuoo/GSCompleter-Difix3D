@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${DIFIX_MODE:-distill}" == "distill" ]]; then
+  exec bash "$ROOT_DIR/infer_dl3dv_distill.sh"
+fi
 cd "$ROOT_DIR"
 
 # The exact 2-context/1-target split used by the revision experiments.
