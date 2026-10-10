@@ -18,7 +18,7 @@ CHECKPOINT="$(to_abs "${CHECKPOINT:-pretrained/depthsplat-gs-base-dl3dv-256x448-
 RUN_ROOT="$(to_abs "${RUN_ROOT:-outputs/dl3dv_difix_distill}")"
 DIFIX_REPO="$(to_abs "${DIFIX_REPO:-../Difix3D}")"
 DIFIX_PYTHON="${DIFIX_PYTHON:-python}"
-DIFIX_MODEL="${DIFIX_MODEL:-nvidia/difix_ref}"
+DIFIX_MODEL="${DIFIX_MODEL:-nvidia/difix}"
 if [[ "$DIFIX_MODEL" == ./* || "$DIFIX_MODEL" == ../* ]]; then
   DIFIX_MODEL="$(to_abs "$DIFIX_MODEL")"
 fi
@@ -55,7 +55,7 @@ CUDA_VISIBLE_DEVICES="$GPU" DIFIX_PHASE=prepare DIFIX_ROOT="$RUN_ROOT" \
   DIFIX_SCENE="$SCENE" DIFIX_OVERWRITE="$OVERWRITE" \
   python -m src.difix_distill "${common_args[@]}"
 
-echo "[2/4] DiFix3D reference-guided target-view repair"
+echo "[2/4] DiFix3D single-view target-view repair"
 difix_args=(
   --input-root "$RUN_ROOT/target_input"
   --output-root "$RUN_ROOT/target_fixed"

@@ -74,16 +74,7 @@ def expected_outputs(root: Path, scene: str, target_id: int, phase: str) -> list
         color / f"{target_id:06d}.png",
         color / f"{target_id:06d}_gt.png",
         target_input / "target.png",
-        target_input / "reference.png",
     ]
-
-
-def nearest_context_index(context_poses: torch.Tensor, target_pose: torch.Tensor) -> int:
-    """Use the closest input camera as the DiFix reference image."""
-    distances = torch.linalg.vector_norm(
-        context_poses[:, :3, 3] - target_pose[:3, 3], dim=-1
-    )
-    return int(distances.argmin().item())
 
 
 def prepare_scene(batch: dict, encoder, decoder, root: Path) -> None:
@@ -101,10 +92,6 @@ def prepare_scene(batch: dict, encoder, decoder, root: Path) -> None:
         save_image(batch["target"]["image"][0, 0], image_dir / f"{target_id:06d}_gt.png")
         target_dir.mkdir(parents=True, exist_ok=True)
         save_image(target_render, target_dir / "target.png")
-        target_pose = batch["target"]["extrinsics"][0, 0]
-        context_poses = batch["context"]["extrinsics"][0]
-        ref_idx = nearest_context_index(context_poses, target_pose)
-        save_image(batch["context"]["image"][0, ref_idx], target_dir / "reference.png")
 
 
 def trainable_gaussians(initial: Gaussians):
