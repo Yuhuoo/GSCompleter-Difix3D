@@ -137,7 +137,8 @@ def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None
         else:
             camera = {key: batch["target"][key]
                       for key in ("extrinsics", "intrinsics", "near", "far")}
-            label = repaired_target[0]
+            # load_image returns [C, H, W], matching the renderer output.
+            label = repaired_target
 
         prediction = render(decoder, current(), camera, shape)
         loss = F.l1_loss(prediction, label)
