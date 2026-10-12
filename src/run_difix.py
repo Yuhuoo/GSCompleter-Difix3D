@@ -1,4 +1,4 @@
-"""Apply the official Difix model to the target renders produced by DepthSplat."""
+"""Apply the official DiFix model to DepthSplat target renders."""
 from __future__ import annotations
 
 import argparse

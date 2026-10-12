@@ -1,4 +1,4 @@
-"""DepthSplat target-view repair followed by Gaussian distillation."""
+"""One-shot DiFix3D-style pseudo-GT distillation from DepthSplat."""
 
 from __future__ import annotations
 
@@ -96,15 +96,19 @@ def prepare_scene(batch: dict, encoder, decoder, root: Path) -> None:
 
 
 class TrainableGaussians:
-    """Trainable DepthSplat Gaussians with lightweight GS topology updates.
+    """Trainable context Gaussians with lightweight topology updates.
 
     The official gsplat strategy cannot be used directly because this branch
     renders with DepthSplat's decoder rather than gsplat's rasterizer.  This
     class mirrors the relevant behavior: high-gradient visible points are
-    split into smaller copies, while nearly transparent points are pruned.
+    cloned or split into smaller copies, while nearly transparent points are
+    pruned.
     """
 
     def __init__(self, initial: Gaussians):
+        # The DepthSplat context representation is the only 3D state that is
+        # optimized.  DiFix supplies a fixed pseudo-GT target image; no target
+        # view is recursively generated during this optimization.
         self.initial_covariances = initial.covariances.detach().clone()
         self.means = nn.Parameter(initial.means.detach().clone())
         self.harmonics = nn.Parameter(initial.harmonics.detach().clone())
@@ -137,6 +141,34 @@ class TrainableGaussians:
             {"params": [self.opacity_logits], "lr": 1e-3},
             {"params": [self.log_scales], "lr": 5e-4},
         ])
+
+    def _clone(self, indices: torch.Tensor) -> int:
+        if indices.numel() == 0:
+            return 0
+        # Clone selected high-gradient points at the same location.  Splitting
+        # below handles the complementary case where a spatial offset helps.
+        clone_opacity = (
+            self.opacity_logits.detach()[:, indices].sigmoid() * 0.5
+        ).clamp(1e-4, 1 - 1e-4)
+        clone_logits = torch.logit(clone_opacity)
+        updated_opacity = self.opacity_logits.detach().clone()
+        updated_opacity[:, indices] = clone_logits
+        self.means = nn.Parameter(torch.cat([
+            self.means.detach(), self.means.detach()[:, indices].clone()
+        ], dim=1))
+        self.harmonics = nn.Parameter(torch.cat([
+            self.harmonics.detach(), self.harmonics.detach()[:, indices].clone()
+        ], dim=1))
+        self.opacity_logits = nn.Parameter(torch.cat([
+            updated_opacity, clone_logits
+        ], dim=1))
+        self.log_scales = nn.Parameter(torch.cat([
+            self.log_scales.detach(), self.log_scales.detach()[:, indices].clone()
+        ], dim=1))
+        self.initial_covariances = torch.cat([
+            self.initial_covariances, self.initial_covariances[:, indices]
+        ], dim=1)
+        return int(indices.numel())
 
     def _append(self, indices: torch.Tensor) -> int:
         if indices.numel() == 0:
@@ -203,24 +235,26 @@ class TrainableGaussians:
         max_gaussians: int,
         opacity_threshold: float,
         min_gaussians: int,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         grad_scores = torch.nan_to_num(grad_scores.detach(), nan=0.0, posinf=0.0, neginf=0.0)
         visible = visible.detach().bool()
         candidate_mask = visible & (grad_scores >= grad_threshold)
         candidate_ids = torch.where(candidate_mask)[0]
         available = max(0, max_gaussians - self.num_gaussians)
         num_to_add = min(int(candidate_ids.numel()), max_new, available)
+        cloned = 0
+        split = 0
         if num_to_add > 0:
             if candidate_ids.numel() > num_to_add:
                 candidate_ids = candidate_ids[
                     torch.topk(grad_scores[candidate_ids], k=num_to_add).indices]
-            added = self._append(candidate_ids)
-        else:
-            added = 0
+            clone_count = num_to_add // 2
+            cloned = self._clone(candidate_ids[:clone_count])
+            split = self._append(candidate_ids[clone_count:])
         removed = self._prune(opacity_threshold, min_gaussians)
-        if added or removed:
+        if cloned or split or removed:
             self.rebuild_optimizer()
-        return added, removed
+        return cloned, split, removed
 
 
 @torch.no_grad()
@@ -269,41 +303,52 @@ def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None
         raise FileNotFoundError(f"Missing DiFix target repair: {fixed_path}")
     repaired_target = load_image(fixed_path).to(device)
 
-    initial = initial_gaussians(encoder, batch)
-    state = TrainableGaussians(initial)
+    context_gaussians = initial_gaussians(encoder, batch)
+    state = TrainableGaussians(context_gaussians)
     initial_means = state.means.detach().clone()
     initial_harmonics = state.harmonics.detach().clone()
     densify_enabled = os.environ.get("DIFIX_DENSIFY", "1") == "1"
-    densify_interval = int(os.environ.get("DIFIX_DENSIFY_INTERVAL", "100"))
-    densify_start = int(os.environ.get("DIFIX_DENSIFY_START", "100"))
-    densify_stop = int(os.environ.get(
-        "DIFIX_DENSIFY_STOP", str(max(densify_start, int(0.7 * steps)))))
+    densify_interval = int(os.environ.get("DIFIX_DENSIFY_INTERVAL", "250"))
     densify_threshold = float(os.environ.get("DIFIX_DENSIFY_GRAD_THRESHOLD", "2e-4"))
     max_new = int(os.environ.get("DIFIX_MAX_NEW_GAUSSIANS", "4096"))
     max_gaussians = int(os.environ.get("DIFIX_MAX_GAUSSIANS", "300000"))
     opacity_threshold = float(os.environ.get("DIFIX_PRUNE_OPACITY", "0.005"))
     min_gaussians = int(os.environ.get("DIFIX_MIN_GAUSSIANS", "1024"))
+    context_loss_weight = float(os.environ.get("DIFIX_CONTEXT_LOSS_WEIGHT", "0.1"))
+    if densify_interval < 1:
+        raise ValueError("DIFIX_DENSIFY_INTERVAL must be positive")
+    if context_loss_weight < 0:
+        raise ValueError("DIFIX_CONTEXT_LOSS_WEIGHT must be non-negative")
+
+    target_camera = {
+        key: batch["target"][key]
+        for key in ("extrinsics", "intrinsics", "near", "far")
+    }
+    context_camera = {
+        key: batch["context"][key]
+        for key in ("extrinsics", "intrinsics", "near", "far")
+    }
+    context_labels = batch["context"]["image"]
     topology_stats = [{"step": 0, "num_gaussians": state.num_gaussians}]
     for step in tqdm(range(steps), desc=f"Distill {scene[:12]}", leave=False):
-        # Keep most updates anchored to the real input views and use the
-        # repaired held-out target as the completion supervision.
-        if step % 10 < 7:
-            index = (step // 10) % 2
-            camera = {key: batch["context"][key][:, index:index + 1]
-                      for key in ("extrinsics", "intrinsics", "near", "far")}
-            label = batch["context"]["image"][0, index]
-        else:
-            camera = {key: batch["target"][key]
-                      for key in ("extrinsics", "intrinsics", "near", "far")}
-            # load_image returns [C, H, W], matching the renderer output.
-            label = repaired_target
-
-        output = decoder(
-            state.current(), camera["extrinsics"], camera["intrinsics"],
-            camera["near"], camera["far"], shape,
+        # One fixed pseudo-GT target drives every iteration.  The observed
+        # context views are replayed only as a small preservation term; this
+        # is not a progressive or autoregressive view-generation procedure.
+        target_output = decoder(
+            state.current(), target_camera["extrinsics"],
+            target_camera["intrinsics"], target_camera["near"],
+            target_camera["far"], shape,
         )
-        prediction = output.color[0, 0]
-        loss = F.l1_loss(prediction, label)
+        target_prediction = target_output.color[0, 0]
+        loss = F.l1_loss(target_prediction, repaired_target)
+        if context_loss_weight > 0:
+            context_output = decoder(
+                state.current(), context_camera["extrinsics"],
+                context_camera["intrinsics"], context_camera["near"],
+                context_camera["far"], shape,
+            )
+            context_loss = F.l1_loss(context_output.color, context_labels)
+            loss = loss + context_loss_weight * context_loss
         loss = loss + 1e-3 * (state.means - initial_means).square().mean()
         loss = loss + 1e-4 * (state.harmonics - initial_harmonics).square().mean()
         loss = loss + 1e-4 * state.log_scales.square().mean()
@@ -314,16 +359,15 @@ def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None
             if state.means.grad is not None
             else torch.zeros(state.num_gaussians, device=device)
         )
-        visible = visible_gaussians(state.means, camera)
+        visible = visible_gaussians(state.means, target_camera)
         state.optimizer.step()
 
         if (
             densify_enabled
             and densify_interval > 0
-            and densify_start <= step < densify_stop
             and (step + 1) % densify_interval == 0
         ):
-            added, removed = state.densify_and_prune(
+            cloned, split, removed = state.densify_and_prune(
                 grad_scores,
                 visible,
                 grad_threshold=densify_threshold,
@@ -334,18 +378,21 @@ def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None
             )
             topology_stats.append({
                 "step": step + 1,
-                "added": added,
+                "cloned": cloned,
+                "split": split,
+                "added": cloned + split,
                 "removed": removed,
                 "num_gaussians": state.num_gaussians,
             })
-            if added or removed:
+            if cloned or split or removed:
                 # Re-anchor the small stabilization terms to the new topology
                 # after parameters have been added or removed.
                 initial_means = state.means.detach().clone()
                 initial_harmonics = state.harmonics.detach().clone()
                 tqdm.write(
                     f"[{scene[:12]}] topology step {step + 1}: "
-                    f"+{added}/-{removed}, N={state.num_gaussians}")
+                    f"clone={cloned}, split={split}, prune={removed}, "
+                    f"N={state.num_gaussians}")
 
     target_id = int(batch["target"]["index"][0, 0])
     target = {key: batch["target"][key] for key in
@@ -360,8 +407,8 @@ def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None
         "steps": steps,
         "densify_enabled": densify_enabled,
         "densify_interval": densify_interval,
-        "densify_start": densify_start,
-        "densify_stop": densify_stop,
+        "context_loss_weight": context_loss_weight,
+        "supervision": "fixed_difix_pseudo_gt_target",
         "initial_gaussians": topology_stats[0]["num_gaussians"],
         "final_gaussians": state.num_gaussians,
         "topology": topology_stats,

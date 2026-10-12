@@ -23,7 +23,14 @@ if [[ "$DIFIX_MODEL" == ./* || "$DIFIX_MODEL" == ../* ]]; then
   DIFIX_MODEL="$(to_abs "$DIFIX_MODEL")"
 fi
 GPU="${GPU:-0}"
-STEPS="${STEPS:-1000}"
+STEPS="${STEPS:-3000}"
+CONTEXT_LOSS_WEIGHT="${CONTEXT_LOSS_WEIGHT:-0.1}"
+DENSIFY_INTERVAL="${DENSIFY_INTERVAL:-250}"
+DENSIFY_GRAD_THRESHOLD="${DENSIFY_GRAD_THRESHOLD:-2e-4}"
+MAX_NEW_GAUSSIANS="${MAX_NEW_GAUSSIANS:-4096}"
+MAX_GAUSSIANS="${MAX_GAUSSIANS:-300000}"
+PRUNE_OPACITY="${PRUNE_OPACITY:-0.005}"
+MIN_GAUSSIANS="${MIN_GAUSSIANS:-1024}"
 SCENE="${SCENE:-}"
 OVERWRITE="${OVERWRITE:-0}"
 EXPECTED_SCENES="${EXPECTED_SCENES:-140}"
@@ -34,6 +41,8 @@ EXPECTED_SCENES="${EXPECTED_SCENES:-140}"
 [[ -f "$ROOT_DIR/src/run_difix.py" ]] || { echo "Missing local DiFix adapter: $ROOT_DIR/src/run_difix.py" >&2; exit 1; }
 [[ -d "$DIFIX_MODEL" ]] || { echo "Missing DIFIX_MODEL directory: $DIFIX_MODEL" >&2; exit 1; }
 [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "STEPS must be a positive integer" >&2; exit 1; }
+[[ "$CONTEXT_LOSS_WEIGHT" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "CONTEXT_LOSS_WEIGHT must be non-negative" >&2; exit 1; }
+[[ "$DENSIFY_INTERVAL" =~ ^[1-9][0-9]*$ ]] || { echo "DENSIFY_INTERVAL must be positive" >&2; exit 1; }
 
 common_args=(
   +experiment=dl3dv
@@ -56,7 +65,7 @@ CUDA_VISIBLE_DEVICES="$GPU" DIFIX_PHASE=prepare DIFIX_ROOT="$RUN_ROOT" \
   DIFIX_SCENE="$SCENE" DIFIX_OVERWRITE="$OVERWRITE" \
   python -m src.difix_distill "${common_args[@]}"
 
-echo "[2/4] DiFix3D+ single-view target-view repair"
+echo "[2/4] DiFix3D single-view target-view repair"
 difix_args=(
   --input-root "$RUN_ROOT/target_input"
   --output-root "$RUN_ROOT/target_fixed"
@@ -69,9 +78,16 @@ difix_args=(
 [[ "$OVERWRITE" != "1" ]] || difix_args+=(--overwrite)
 CUDA_VISIBLE_DEVICES="$GPU" "$DIFIX_PYTHON" "$ROOT_DIR/src/run_difix.py" "${difix_args[@]}"
 
-echo "[3/4] Distilling the repaired target view into trainable Gaussians ($STEPS steps/scene)"
+echo "[3/4] One-shot pseudo-GT distillation with context-Gaussian optimization ($STEPS steps/scene)"
 CUDA_VISIBLE_DEVICES="$GPU" DIFIX_PHASE=distill DIFIX_ROOT="$RUN_ROOT" \
   DIFIX_SCENE="$SCENE" DIFIX_OVERWRITE="$OVERWRITE" DIFIX_STEPS="$STEPS" \
+  DIFIX_CONTEXT_LOSS_WEIGHT="$CONTEXT_LOSS_WEIGHT" \
+  DIFIX_DENSIFY_INTERVAL="$DENSIFY_INTERVAL" \
+  DIFIX_DENSIFY_GRAD_THRESHOLD="$DENSIFY_GRAD_THRESHOLD" \
+  DIFIX_MAX_NEW_GAUSSIANS="$MAX_NEW_GAUSSIANS" \
+  DIFIX_MAX_GAUSSIANS="$MAX_GAUSSIANS" \
+  DIFIX_PRUNE_OPACITY="$PRUNE_OPACITY" \
+  DIFIX_MIN_GAUSSIANS="$MIN_GAUSSIANS" \
   python -m src.difix_distill "${common_args[@]}"
 
 echo "[4/4] Evaluating held-out target renders"

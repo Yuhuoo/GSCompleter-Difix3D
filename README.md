@@ -56,6 +56,31 @@ The environment is stored under `.conda/` on the shared filesystem, uses PyTorch
 
 The weight cache is `../Difix3D/checkpoints/nvidia-difix`. Set `DIFIX_WEIGHTS_DIR` or `DIFIX_MODEL` if the shared storage layout differs.
 
+### DiFix3D-style DL3DV comparison
+
+The one-shot comparison in `infer_dl3dv_distill.sh` has four fixed stages:
+
+1. DepthSplat renders the held-out target view from the two context views.
+2. The official `nvidia-difix` model repairs that render, producing a fixed
+   pseudo ground-truth image.
+3. The DepthSplat context Gaussians are made trainable and optimized against
+   that fixed pseudo ground truth. A small context-view replay loss preserves
+   the observed views. Gradient-driven clone/split and opacity pruning are
+   applied at a fixed interval; no recursive view generation or progressive
+   pseudo-GT update is used.
+4. The optimized context Gaussian scene is rendered at the held-out target
+   pose and evaluated against the real target image.
+
+For a single scene, run:
+
+```bash
+STEPS=3000 SCENE=<scene-id> OVERWRITE=1 bash infer_dl3dv_distill.sh
+```
+
+`CONTEXT_LOSS_WEIGHT` and `DENSIFY_INTERVAL` default to `0.1` and `250`.
+The output records the supervision type and final Gaussian count in
+`outputs/dl3dv_difix_distill/distilled/stats/<scene-id>.json`.
+
 Our code is developed using PyTorch 2.4.0, CUDA 12.4, and Python 3.10. 
 
 We recommend setting up a virtual environment using either [conda](https://docs.anaconda.com/miniconda/) or [venv](https://docs.python.org/3/library/venv.html) before installation:
