@@ -51,6 +51,7 @@ common_args=(
   dataset/view_sampler=evaluation
   dataset.view_sampler.num_context_views=2
   "dataset.view_sampler.index_path=$INDEX_PATH"
+  dataset.image_shape=[256,448]
   model.encoder.num_scales=2
   model.encoder.upsample_factor=4
   model.encoder.lowest_feature_resolution=8

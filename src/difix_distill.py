@@ -22,7 +22,117 @@ from .model.encoder import get_encoder
 from .model.types import Gaussians
 
 
+def _renderable_gaussians(
+    gaussians: Gaussians,
+    camera: dict,
+    shape: tuple[int, int],
+) -> Gaussians:
+    """Filter pathological Gaussians before calling the CUDA rasterizer."""
+    if gaussians.means.ndim != 3 or gaussians.means.shape[0] != 1:
+        raise ValueError(
+            f"Expected single-scene Gaussians [1,G,*], got "
+            f"means={tuple(gaussians.means.shape)}"
+        )
+
+    h, w = shape
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Invalid render shape: {shape}")
+
+    extrinsics = camera["extrinsics"][0, 0]
+    intrinsics = camera["intrinsics"][0, 0]
+    near = camera["near"][0, 0].detach().float()
+    far = camera["far"][0, 0].detach().float()
+    near_value = near.item()
+    far_value = far.item()
+    if not torch.isfinite(near).item() or not torch.isfinite(far).item() or not (0 < near_value < far_value):
+        raise ValueError(f"Invalid render bounds: near={near.item()}, far={far.item()}")
+
+    points = gaussians.means[0]
+    covariance = gaussians.covariances[0]
+    points_h = torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
+    camera_points = (torch.linalg.inv(extrinsics) @ points_h.t()).t()[..., :3]
+    depth = camera_points[..., 2]
+    projected = camera_points @ intrinsics.transpose(0, 1)
+    safe_depth = depth.clamp_min(1e-6)
+    uv = projected[..., :2] / safe_depth[..., None]
+
+    finite = (
+        torch.isfinite(points).all(dim=-1)
+        & torch.isfinite(covariance).all(dim=(-1, -2))
+        & torch.isfinite(gaussians.harmonics[0]).all(dim=(-1, -2))
+        & torch.isfinite(gaussians.opacities[0])
+        & torch.isfinite(camera_points).all(dim=-1)
+        & torch.isfinite(uv).all(dim=-1)
+    )
+    covariance_diag = covariance.diagonal(dim1=-2, dim2=-1)
+    finite = finite & torch.isfinite(covariance_diag).all(dim=-1)
+
+    # Intrinsics are normalized by the dataset. This bounds the projected
+    # footprint before the rasterizer expands its internal tile buffers.
+    focal_pixels = torch.maximum(
+        intrinsics[0, 0].abs() * w,
+        intrinsics[1, 1].abs() * h,
+    )
+    radius_pixels = (
+        3.0 * covariance_diag.clamp_min(0).amax(dim=-1).sqrt()
+        * focal_pixels / safe_depth
+    )
+    max_radius = float(os.environ.get("DIFIX_MAX_RENDER_GAUSSIAN_RADIUS", "128"))
+    if max_radius <= 0:
+        raise ValueError("DIFIX_MAX_RENDER_GAUSSIAN_RADIUS must be positive")
+
+    visible = (
+        finite
+        & (depth > near * 0.5)
+        & (depth < far * 1.05)
+        & (uv[..., 0] >= -1.0)
+        & (uv[..., 0] <= 2.0)
+        & (uv[..., 1] >= -1.0)
+        & (uv[..., 1] <= 2.0)
+        & (radius_pixels <= max_radius)
+    )
+
+    # Keep a small valid set even for an unusually sparse view, choosing the
+    # smallest projected footprints rather than reintroducing invalid points.
+    min_keep = min(1024, points.shape[0])
+    if int(visible.sum()) < min_keep:
+        fallback = finite & (depth > near * 0.5) & (depth < far * 1.05)
+        fallback_ids = torch.where(fallback)[0]
+        if fallback_ids.numel() > 0:
+            count = min(min_keep, int(fallback_ids.numel()))
+            chosen = fallback_ids[torch.topk(
+                radius_pixels[fallback_ids].nan_to_num(float("inf")),
+                k=count,
+                largest=False,
+            ).indices]
+            visible = torch.zeros_like(finite)
+            visible[chosen] = True
+
+    if not visible.any():
+        raise RuntimeError(
+            "No finite Gaussians remain for DiFix rendering; "
+            "enable DIFIX_DEBUG_RENDER=1 to inspect the camera/depth bounds."
+        )
+
+    if os.environ.get("DIFIX_DEBUG_RENDER", "0") == "1":
+        finite_radius = radius_pixels[finite].nan_to_num()
+        print(
+            f"[DiFix render] shape={shape}, gaussians={points.shape[0]} -> "
+            f"{int(visible.sum())}, depth=[{depth[finite].min().item():.4g}, "
+            f"{depth[finite].max().item():.4g}], "
+            f"radius_max={finite_radius.max().item():.4g}"
+        )
+
+    return Gaussians(
+        means=gaussians.means[:, visible],
+        covariances=gaussians.covariances[:, visible],
+        harmonics=gaussians.harmonics[:, visible],
+        opacities=gaussians.opacities[:, visible],
+    )
+
+
 def render(decoder, gaussians: Gaussians, camera: dict, shape: tuple[int, int]) -> torch.Tensor:
+    gaussians = _renderable_gaussians(gaussians, camera, shape)
     return decoder(
         gaussians, camera["extrinsics"], camera["intrinsics"],
         camera["near"], camera["far"], shape,
