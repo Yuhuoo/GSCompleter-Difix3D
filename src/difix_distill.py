@@ -123,7 +123,7 @@ def _renderable_gaussians(
     )
 
     max_gaussians = (
-        int(os.environ.get("DIFIX_MAX_RENDER_GAUSSIANS", "120000"))
+        int(os.environ.get("DIFIX_MAX_RENDER_GAUSSIANS", "300000"))
         if max_gaussians_override is None
         else int(max_gaussians_override)
     )
@@ -190,7 +190,7 @@ def _renderable_gaussians(
 
 
 def render(decoder, gaussians: Gaussians, camera: dict, shape: tuple[int, int]) -> torch.Tensor:
-    max_gaussians = int(os.environ.get("DIFIX_MAX_RENDER_GAUSSIANS", "120000"))
+    max_gaussians = int(os.environ.get("DIFIX_MAX_RENDER_GAUSSIANS", "300000"))
     for attempt in range(3):
         renderable = _renderable_gaussians(
             gaussians,
