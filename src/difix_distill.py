@@ -26,6 +26,7 @@ def _renderable_gaussians(
     gaussians: Gaussians,
     camera: dict,
     shape: tuple[int, int],
+    max_gaussians_override: int | None = None,
 ) -> Gaussians:
     """Filter pathological Gaussians before calling the CUDA rasterizer."""
     if gaussians.means.ndim != 3 or gaussians.means.shape[0] != 1:
@@ -49,41 +50,70 @@ def _renderable_gaussians(
 
     points = gaussians.means[0]
     covariance = gaussians.covariances[0]
-    points_h = torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
-    camera_points = (torch.linalg.inv(extrinsics) @ points_h.t()).t()[..., :3]
-    depth = camera_points[..., 2]
-    projected = camera_points @ intrinsics.transpose(0, 1)
-    safe_depth = depth.clamp_min(1e-6)
-    uv = projected[..., :2] / safe_depth[..., None]
 
-    finite = (
-        torch.isfinite(points).all(dim=-1)
-        & torch.isfinite(covariance).all(dim=(-1, -2))
-        & torch.isfinite(gaussians.harmonics[0]).all(dim=(-1, -2))
-        & torch.isfinite(gaussians.opacities[0])
-        & torch.isfinite(camera_points).all(dim=-1)
-        & torch.isfinite(uv).all(dim=-1)
-    )
-    covariance_diag = covariance.diagonal(dim1=-2, dim2=-1)
-    finite = finite & torch.isfinite(covariance_diag).all(dim=-1)
+    # The mask is discrete, so camera-space checks do not need an autograd
+    # graph. Indexing the original tensors below still preserves the graph
+    # needed by the renderer during distillation.
+    with torch.no_grad():
+        points_h = torch.cat([points.detach(), torch.ones_like(points[..., :1])], dim=-1)
+        camera_points = (torch.linalg.inv(extrinsics) @ points_h.t()).t()[..., :3]
+        depth = camera_points[..., 2]
+        projected = camera_points @ intrinsics.transpose(0, 1)
+        safe_depth = depth.clamp_min(1e-6)
+        uv = projected[..., :2] / safe_depth[..., None]
 
-    # Intrinsics are normalized by the dataset. This bounds the projected
-    # footprint before the rasterizer expands its internal tile buffers.
-    focal_pixels = torch.maximum(
-        intrinsics[0, 0].abs() * w,
-        intrinsics[1, 1].abs() * h,
-    )
-    radius_pixels = (
-        3.0 * covariance_diag.clamp_min(0).amax(dim=-1).sqrt()
-        * focal_pixels / safe_depth
-    )
-    max_radius = float(os.environ.get("DIFIX_MAX_RENDER_GAUSSIAN_RADIUS", "128"))
+        finite = (
+            torch.isfinite(points).all(dim=-1)
+            & torch.isfinite(covariance).all(dim=(-1, -2))
+            & torch.isfinite(gaussians.harmonics[0]).all(dim=(-1, -2))
+            & torch.isfinite(gaussians.opacities[0])
+            & torch.isfinite(camera_points).all(dim=-1)
+            & torch.isfinite(uv).all(dim=-1)
+        )
+
+        # Compute the actual first-order 2-D projected covariance. Checking
+        # only world-space diagonal entries misses long tilted ellipses and
+        # Gaussians whose depth variance crosses the near plane; both cases
+        # can make the rasterizer allocate an enormous tile buffer.
+        world_to_camera = torch.linalg.inv(extrinsics)[:3, :3]
+        cov_camera = torch.einsum(
+            "ij,gjk,lk->gil",
+            world_to_camera,
+            covariance.detach(),
+            world_to_camera,
+        )
+        cov_camera = 0.5 * (cov_camera + cov_camera.transpose(-1, -2))
+        covariance_eigenvalues = torch.linalg.eigvalsh(cov_camera)
+        depth_variance = cov_camera[..., 2, 2].clamp_min(0)
+        depth_sigma = depth_variance.sqrt()
+
+        # Intrinsics are normalized by the dataset; convert the Jacobian to
+        # pixel units before estimating the footprint.
+        fx = intrinsics[0, 0].abs() * w
+        fy = intrinsics[1, 1].abs() * h
+        x = camera_points[..., 0]
+        y = camera_points[..., 1]
+        z2 = safe_depth.square()
+        j00 = fx / safe_depth
+        j02 = -fx * x / z2
+        j11 = fy / safe_depth
+        j12 = -fy * y / z2
+        c00 = j00.square() * cov_camera[..., 0, 0] + 2 * j00 * j02 * cov_camera[..., 0, 2] + j02.square() * cov_camera[..., 2, 2]
+        c11 = j11.square() * cov_camera[..., 1, 1] + 2 * j11 * j12 * cov_camera[..., 1, 2] + j12.square() * cov_camera[..., 2, 2]
+        c01 = j00 * j11 * cov_camera[..., 0, 1] + j00 * j12 * cov_camera[..., 0, 2] + j02 * j11 * cov_camera[..., 1, 2] + j02 * j12 * cov_camera[..., 2, 2]
+        eig_gap = torch.sqrt((c00 - c11).square() + 4 * c01.square())
+        radius_pixels = 3.0 * (0.5 * (c00 + c11 + eig_gap)).clamp_min(0).sqrt()
+        finite = finite & torch.isfinite(cov_camera).all(dim=(-1, -2))
+        finite = finite & torch.isfinite(covariance_eigenvalues).all(dim=-1)
+        finite = finite & (covariance_eigenvalues[..., 0] >= -1e-6)
+        finite = finite & torch.isfinite(radius_pixels) & torch.isfinite(depth_sigma)
+    max_radius = float(os.environ.get("DIFIX_MAX_RENDER_GAUSSIAN_RADIUS", "64"))
     if max_radius <= 0:
         raise ValueError("DIFIX_MAX_RENDER_GAUSSIAN_RADIUS must be positive")
 
     visible = (
         finite
-        & (depth > near * 0.5)
+        & (depth - 3.0 * depth_sigma > near * 0.5)
         & (depth < far * 1.05)
         & (uv[..., 0] >= -1.0)
         & (uv[..., 0] <= 2.0)
@@ -92,11 +122,37 @@ def _renderable_gaussians(
         & (radius_pixels <= max_radius)
     )
 
+    max_gaussians = (
+        int(os.environ.get("DIFIX_MAX_RENDER_GAUSSIANS", "120000"))
+        if max_gaussians_override is None
+        else int(max_gaussians_override)
+    )
+    if max_gaussians <= 0:
+        raise ValueError("DIFIX_MAX_RENDER_GAUSSIANS must be positive")
+
+    # The encoder emits one Gaussian per pixel (229,376 at 256x448). Cap the
+    # active set because rasterizer tile buffers grow with this count. Opaque,
+    # compact footprints carry the most visible signal.
+    candidate_ids = torch.where(visible)[0]
+    if candidate_ids.numel() > max_gaussians:
+        opacity = gaussians.opacities[0].detach().clamp_min(1e-6)
+        score = opacity / (1.0 + radius_pixels.detach())
+        keep_ids = candidate_ids[
+            torch.topk(score[candidate_ids], k=max_gaussians, largest=True).indices
+        ]
+        visible = torch.zeros_like(visible)
+        visible[keep_ids] = True
+
     # Keep a small valid set even for an unusually sparse view, choosing the
     # smallest projected footprints rather than reintroducing invalid points.
-    min_keep = min(1024, points.shape[0])
+    min_keep = min(1024, max_gaussians, points.shape[0])
     if int(visible.sum()) < min_keep:
-        fallback = finite & (depth > near * 0.5) & (depth < far * 1.05)
+        fallback = (
+            finite
+            & (depth - 3.0 * depth_sigma > near * 0.5)
+            & (depth < far * 1.05)
+            & (radius_pixels <= max_radius)
+        )
         fallback_ids = torch.where(fallback)[0]
         if fallback_ids.numel() > 0:
             count = min(min_keep, int(fallback_ids.numel()))
@@ -116,11 +172,13 @@ def _renderable_gaussians(
 
     if os.environ.get("DIFIX_DEBUG_RENDER", "0") == "1":
         finite_radius = radius_pixels[finite].nan_to_num()
+        visible_radius = radius_pixels[visible].nan_to_num()
         print(
             f"[DiFix render] shape={shape}, gaussians={points.shape[0]} -> "
             f"{int(visible.sum())}, depth=[{depth[finite].min().item():.4g}, "
             f"{depth[finite].max().item():.4g}], "
-            f"radius_max={finite_radius.max().item():.4g}"
+            f"radius_max={finite_radius.max().item():.4g}, "
+            f"visible_radius_max={visible_radius.max().item():.4g}"
         )
 
     return Gaussians(
@@ -132,11 +190,31 @@ def _renderable_gaussians(
 
 
 def render(decoder, gaussians: Gaussians, camera: dict, shape: tuple[int, int]) -> torch.Tensor:
-    gaussians = _renderable_gaussians(gaussians, camera, shape)
-    return decoder(
-        gaussians, camera["extrinsics"], camera["intrinsics"],
-        camera["near"], camera["far"], shape,
-    ).color[0, 0]
+    max_gaussians = int(os.environ.get("DIFIX_MAX_RENDER_GAUSSIANS", "120000"))
+    for attempt in range(3):
+        renderable = _renderable_gaussians(
+            gaussians,
+            camera,
+            shape,
+            max_gaussians_override=max_gaussians,
+        )
+        try:
+            return decoder(
+                renderable,
+                camera["extrinsics"],
+                camera["intrinsics"],
+                camera["near"],
+                camera["far"],
+                shape,
+            ).color[0, 0]
+        except torch.cuda.OutOfMemoryError:
+            del renderable
+            torch.cuda.empty_cache()
+            if attempt == 2 or max_gaussians <= 8192:
+                raise
+            max_gaussians = max(8192, max_gaussians // 2)
+            if os.environ.get("DIFIX_DEBUG_RENDER", "0") == "1":
+                print(f"[DiFix render] rasterizer OOM; retrying with {max_gaussians} Gaussians")
 
 
 def initialize(cfg):
@@ -444,26 +522,37 @@ def distill_scene(batch: dict, encoder, decoder, root: Path, steps: int) -> None
         # One fixed pseudo-GT target drives every iteration.  The observed
         # context views are replayed only as a small preservation term; this
         # is not a progressive or autoregressive view-generation procedure.
-        target_output = decoder(
-            state.current(), target_camera["extrinsics"],
-            target_camera["intrinsics"], target_camera["near"],
-            target_camera["far"], shape,
-        )
-        target_prediction = target_output.color[0, 0]
-        loss = F.l1_loss(target_prediction, repaired_target)
-        if context_loss_weight > 0:
-            context_output = decoder(
-                state.current(), context_camera["extrinsics"],
-                context_camera["intrinsics"], context_camera["near"],
-                context_camera["far"], shape,
-            )
-            context_loss = F.l1_loss(context_output.color, context_labels)
-            loss = loss + context_loss_weight * context_loss
-        loss = loss + 1e-3 * (state.means - initial_means).square().mean()
-        loss = loss + 1e-4 * (state.harmonics - initial_harmonics).square().mean()
-        loss = loss + 1e-4 * state.log_scales.square().mean()
         state.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+
+        # Backpropagate each view separately. Keeping target and both context
+        # rasterizer graphs alive until one combined backward can exceed GPU
+        # memory even when each individual render fits.
+        target_prediction = render(decoder, state.current(), target_camera, shape)
+        F.l1_loss(target_prediction, repaired_target).backward()
+        del target_prediction
+
+        if context_loss_weight > 0:
+            num_context_views = context_camera["extrinsics"].shape[1]
+            for view_idx in range(num_context_views):
+                single_camera = {
+                    key: value[:, view_idx:view_idx + 1]
+                    for key, value in context_camera.items()
+                }
+                context_prediction = render(
+                    decoder, state.current(), single_camera, shape
+                )
+                context_label = context_labels[0, view_idx]
+                (context_loss_weight / num_context_views * F.l1_loss(
+                    context_prediction, context_label
+                )).backward()
+                del context_prediction
+
+        regularization = (
+            1e-3 * (state.means - initial_means).square().mean()
+            + 1e-4 * (state.harmonics - initial_harmonics).square().mean()
+            + 1e-4 * state.log_scales.square().mean()
+        )
+        regularization.backward()
         grad_scores = (
             state.means.grad.detach().norm(dim=-1).squeeze(0)
             if state.means.grad is not None

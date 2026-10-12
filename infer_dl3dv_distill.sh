@@ -27,6 +27,8 @@ STEPS="${STEPS:-3000}"
 CONTEXT_LOSS_WEIGHT="${CONTEXT_LOSS_WEIGHT:-0.1}"
 DENSIFY_INTERVAL="${DENSIFY_INTERVAL:-250}"
 DENSIFY_GRAD_THRESHOLD="${DENSIFY_GRAD_THRESHOLD:-2e-4}"
+MAX_RENDER_GAUSSIANS="${MAX_RENDER_GAUSSIANS:-120000}"
+MAX_RENDER_RADIUS="${MAX_RENDER_RADIUS:-64}"
 MAX_NEW_GAUSSIANS="${MAX_NEW_GAUSSIANS:-4096}"
 MAX_GAUSSIANS="${MAX_GAUSSIANS:-300000}"
 PRUNE_OPACITY="${PRUNE_OPACITY:-0.005}"
@@ -43,6 +45,8 @@ EXPECTED_SCENES="${EXPECTED_SCENES:-140}"
 [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "STEPS must be a positive integer" >&2; exit 1; }
 [[ "$CONTEXT_LOSS_WEIGHT" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "CONTEXT_LOSS_WEIGHT must be non-negative" >&2; exit 1; }
 [[ "$DENSIFY_INTERVAL" =~ ^[1-9][0-9]*$ ]] || { echo "DENSIFY_INTERVAL must be positive" >&2; exit 1; }
+[[ "$MAX_RENDER_GAUSSIANS" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_RENDER_GAUSSIANS must be positive" >&2; exit 1; }
+[[ "$MAX_RENDER_RADIUS" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || { echo "MAX_RENDER_RADIUS must be positive" >&2; exit 1; }
 
 common_args=(
   +experiment=dl3dv
@@ -64,6 +68,8 @@ common_args=(
 echo "[1/4] DepthSplat initialization and target-view render"
 CUDA_VISIBLE_DEVICES="$GPU" DIFIX_PHASE=prepare DIFIX_ROOT="$RUN_ROOT" \
   DIFIX_SCENE="$SCENE" DIFIX_OVERWRITE="$OVERWRITE" \
+  DIFIX_MAX_RENDER_GAUSSIANS="$MAX_RENDER_GAUSSIANS" \
+  DIFIX_MAX_RENDER_GAUSSIAN_RADIUS="$MAX_RENDER_RADIUS" \
   python -m src.difix_distill "${common_args[@]}"
 
 echo "[2/4] DiFix3D single-view target-view repair"
@@ -82,6 +88,8 @@ CUDA_VISIBLE_DEVICES="$GPU" "$DIFIX_PYTHON" "$ROOT_DIR/src/run_difix.py" "${difi
 echo "[3/4] One-shot pseudo-GT distillation with context-Gaussian optimization ($STEPS steps/scene)"
 CUDA_VISIBLE_DEVICES="$GPU" DIFIX_PHASE=distill DIFIX_ROOT="$RUN_ROOT" \
   DIFIX_SCENE="$SCENE" DIFIX_OVERWRITE="$OVERWRITE" DIFIX_STEPS="$STEPS" \
+  DIFIX_MAX_RENDER_GAUSSIANS="$MAX_RENDER_GAUSSIANS" \
+  DIFIX_MAX_RENDER_GAUSSIAN_RADIUS="$MAX_RENDER_RADIUS" \
   DIFIX_CONTEXT_LOSS_WEIGHT="$CONTEXT_LOSS_WEIGHT" \
   DIFIX_DENSIFY_INTERVAL="$DENSIFY_INTERVAL" \
   DIFIX_DENSIFY_GRAD_THRESHOLD="$DENSIFY_GRAD_THRESHOLD" \

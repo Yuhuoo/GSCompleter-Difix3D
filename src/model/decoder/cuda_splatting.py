@@ -88,12 +88,15 @@ def render_cuda(
     all_images = []
     all_radii = []
     for i in range(b):
-        # Set up a tensor for the gradients of the screen-space means.
-        mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
-        try:
+        # Screen-space gradients are not consumed by DepthSplat's decoder.
+        # Avoid allocating/retaining them during inference; this lowers the
+        # peak memory of the CUDA rasterizer.
+        mean_gradients = torch.zeros_like(
+            gaussian_means[i],
+            requires_grad=torch.is_grad_enabled() and gaussian_means[i].requires_grad,
+        )
+        if mean_gradients.requires_grad:
             mean_gradients.retain_grad()
-        except Exception:
-            pass
 
         settings = GaussianRasterizationSettings(
             image_height=h,
